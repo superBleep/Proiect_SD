@@ -17,6 +17,7 @@ type data struct {
 	using     bool
 	requestQ  []string
 	asked     bool
+	state     string
 }
 
 type message struct {
@@ -25,7 +26,6 @@ type message struct {
 	message string
 }
 
-// ReadTree reads the tree structure from a file
 func ReadTree() ([][]string, error) {
 	file, err := os.Open("tree.dat")
 	if err != nil {
@@ -35,115 +35,172 @@ func ReadTree() ([][]string, error) {
 
 	var tree [][]string
 	scanner := bufio.NewScanner(file)
-
 	for scanner.Scan() {
 		line := scanner.Text()
 		row := strings.Fields(line)
-
 		tree = append(tree, row)
 	}
 
 	return tree, nil
 }
 
-// SelectInitiator returns the node which initiates the algorithm
 func SelectInitiator(nodes []string) (string, error) {
 	var initiator string
-	isInNodes := false
-
-	// Read the id of the initiator node from stdinput
 	fmt.Print("Available nodes: ")
 	for _, node := range nodes {
 		fmt.Print(node, " ")
 	}
 	fmt.Print("\nSelect initiator: ")
 
-	fmt.Scanln(&initiator)
+	_, err := fmt.Scanln(&initiator)
+	if err != nil {
+		return "", err
+	}
 
-	// Check the validtiy of the input value
-	for isInNodes == false {
+	for !contains(nodes, initiator) {
+		fmt.Println("\nThe selected node is not valid.")
+		fmt.Print("Available nodes: ")
 		for _, node := range nodes {
-			if node == initiator {
-				isInNodes = true
-				break
-			}
+			fmt.Print(node, " ")
 		}
-		if !isInNodes {
-			fmt.Println("\nThe selected node is not valid.")
-			fmt.Print("Available nodes: ")
-			for _, node := range nodes {
-				fmt.Print(node, " ")
-			}
-			fmt.Print("\nSelect initiator: ")
-
-			fmt.Scanln(&initiator)
+		fmt.Print("\nSelect initiator: ")
+		_, err := fmt.Scanln(&initiator)
+		if err != nil {
+			return "", err
 		}
 	}
 
 	return initiator, nil
 }
 
-func TreeNode(id string, neighbors []string, initiator bool, channel chan message, wg *sync.WaitGroup) {
-	defer wg.Done()
-
-	nodeData := data{id: id, neighbors: neighbors}
-
-	if initiator {
-		for _, neighbor := range nodeData.neighbors {
-			channel <- message{nodeData.id, neighbor, "INITIALIZE"}
+func contains(nodes []string, node string) bool {
+	for _, n := range nodes {
+		if n == node {
+			return true
 		}
-	} else {
-		msg := <-channel
+	}
+	return false
+}
 
+func processMessage(nodeData *data, msg message, channels map[string]chan message) {
+	switch nodeData.state {
+	case "Initializing":
 		if msg.destId == nodeData.id && msg.message == "INITIALIZE" {
 			nodeData.holder = msg.srcId
-
 			for _, neighbor := range nodeData.neighbors {
 				if neighbor != msg.srcId {
-					channel <- message{nodeData.id, neighbor, "INITIALIZE"}
+					channels[neighbor] <- message{nodeData.id, neighbor, "INITIALIZE"}
+					time.Sleep(100 * time.Millisecond) // Simulate delay
 				}
 			}
+			fmt.Printf("%s received INITIALIZE message from %s.\n", nodeData.id, msg.srcId)
+			if nodeData.id != nodeData.holder {
+				nodeData.asked = true
+				channels[nodeData.holder] <- message{nodeData.id, nodeData.holder, "REQUEST"}
+				fmt.Printf("%s requested the token from %s.\n", nodeData.id, nodeData.holder)
+				time.Sleep(100 * time.Millisecond) // Simulate delay
+			}
+			nodeData.state = "Waiting"
+		}
 
-			fmt.Println(nodeData)
+	case "Waiting":
+		if msg.destId == nodeData.id && msg.message == "TOKEN" {
+			// enterCriticalSection(nodeData, channels)
+		} else if msg.destId == nodeData.id && msg.message == "REQUEST" {
+			nodeData.requestQ = append(nodeData.requestQ, msg.srcId)
+			attemptToSendToken(nodeData, channels)
+		}
+
+	case "InCriticalSection":
+		// Node is in the critical section or has terminated.
+	}
+}
+
+func enterCriticalSection(nodeData *data, channels map[string]chan message) {
+	nodeData.holder = nodeData.id
+	nodeData.using = true
+	nodeData.asked = false
+	fmt.Printf("%s is in the critical section.\n", nodeData.id)
+	time.Sleep(20 * time.Second) // Simulate critical section work
+	exitCriticalSection(nodeData, channels)
+}
+
+func exitCriticalSection(nodeData *data, channels map[string]chan message) {
+	nodeData.using = false
+	attemptToSendToken(nodeData, channels)
+	nodeData.state = "InCriticalSection" // Update state after critical section work is done
+}
+
+func attemptToSendToken(nodeData *data, channels map[string]chan message) {
+	fmt.Printf("%s is attempting to send TOKEN.\n", nodeData.id)
+	if !nodeData.using && len(nodeData.requestQ) > 0 {
+		next := nodeData.requestQ[0]
+		nodeData.requestQ = nodeData.requestQ[1:]
+		channels[next] <- message{nodeData.id, next, "TOKEN"}
+		fmt.Printf("%s sent TOKEN to %s.\n", nodeData.id, next)
+	}
+}
+
+func TreeNode(id string, neighbors []string, initiator bool, channels map[string]chan message, wg *sync.WaitGroup) {
+	defer wg.Done()
+
+	nodeData := data{id: id, neighbors: neighbors, state: "Initializing"}
+	myChannel := channels[id]
+
+	if initiator {
+		nodeData.holder = id // Initiator holds the token initially
+		for _, neighbor := range nodeData.neighbors {
+			channels[neighbor] <- message{nodeData.id, neighbor, "INITIALIZE"}
+			time.Sleep(100 * time.Millisecond) // Simulate delay
+		}
+		nodeData.state = "Waiting"
+	}
+
+	timer := time.NewTimer(20 * time.Second) // Start a timer for 20 seconds
+
+	for {
+		select {
+		case msg := <-myChannel:
+			processMessage(&nodeData, msg, channels)
+		case <-timer.C: // Wait for the timer to expire
+			fmt.Println("Exiting loop")
+			return // Exit the loop
 		}
 	}
 }
 
 func main() {
 	var wg sync.WaitGroup
-	var nodes []string
-	channel := make(chan message)
 
-	// Read the tree structure from a file
 	tree, err := ReadTree()
 	if err != nil {
 		log.Fatalln(err)
 	}
 
-	// Get the names of all the nodes
+	channels := make(map[string]chan message)
+	for _, arr := range tree {
+		channels[arr[0]] = make(chan message, len(arr)-1)
+	}
+
+	var nodes []string
 	for _, arr := range tree {
 		nodes = append(nodes, arr[0])
 	}
 
-	// Read the initator node from stdinput
 	initiator, err := SelectInitiator(nodes)
 	if err != nil {
 		log.Fatalln(err)
 	}
 
-	// Simulate nodes
 	for i := 0; i < len(tree); i++ {
 		wg.Add(1)
-
-		// Start nodes and mark the initiator node
-		if tree[i][0] == initiator {
-			go TreeNode(tree[i][0], tree[i][1:], true, channel, &wg)
-		} else {
-			go TreeNode(tree[i][0], tree[i][1:], false, channel, &wg)
-		}
-
-		time.Sleep(time.Second) // Simulate delay in starting nodes
+		go TreeNode(tree[i][0], tree[i][1:], tree[i][0] == initiator, channels, &wg)
+		time.Sleep(time.Second)
 	}
 
-	close(channel) // Close the communication channel
+	wg.Wait()
+
+	for _, ch := range channels {
+		close(ch)
+	}
 }
